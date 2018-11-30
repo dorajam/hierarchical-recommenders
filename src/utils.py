@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import MultiLabelBinarizer
 
 
 def load_movielense_20m(folder='../data/ml-20m'):
@@ -22,7 +23,7 @@ def three_way_split(df, ratio=(.7, .1, .2), timestamp_col='timestamp'):
     :ratio:         Split ratio for train, validation, test set, respectively.
     :timestamp_col: Timestamp column name
     
-    :rtype:         Validation, train, and test sets
+    :rtype:         Train, validation and test sets
     """
     train_frac, val_frac, test_frac = ratio
     df[timestamp_col] = pd.to_datetime(df[timestamp_col])
@@ -38,6 +39,27 @@ def three_way_split(df, ratio=(.7, .1, .2), timestamp_col='timestamp'):
     return train, validation, test
 
 
+def two_way_split(df, train_frac=.8, timestamp_col='timestamp'):
+    """
+    Performs two-way time-based split to generate two datasets.
+    
+    :df:            User-item interactions dataset, one row per user, item, interaction timestamp
+    :train_frac:    Split ratio.
+    :timestamp_col: Timestamp column name
+    
+    :rtype:         Train and test sets
+    """
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+    df = df.sort_values([timestamp_col])
+    
+    anchor_train = int(df.shape[0] * train_frac)
+    
+    train = df.iloc[:anchor_train]
+    test = df.iloc[anchor_train:]
+    
+    return train, test
+
+
 def get_taxonomy_labels(tags, movies):
     """
     Takes tags and movies dataframe, and returns a joined dataframe with
@@ -50,8 +72,8 @@ def get_taxonomy_labels(tags, movies):
     df = pd.DataFrame(rows, columns=movies.columns).set_index(['movieId', 'title'])
     movie_categories = df.reset_index()
     taxonomy_labels = pd.merge(tags, movie_categories, 'inner', 'movieId')[['tag', 'genres', 'movieId']].drop_duplicates()
-    taxonomy_labels['category'] = taxonomy_labels.iloc[:, ('genres')]
-    taxonomy_labels['item_id'] = taxonomy_labels.iloc[:, ('movieId')]
+    taxonomy_labels = taxonomy_labels.assign(category=taxonomy_labels['genres'])
+    taxonomy_labels = taxonomy_labels.assign(item_id=taxonomy_labels['movieId'])
 
     return taxonomy_labels.drop(columns=['genres', 'movieId'])
 
@@ -70,17 +92,31 @@ def generate_k_fold_split_datasets(original, timestamp_col='timestamp', k=3):
 
 def _preprocess_ratings(ratings):
     ratings = ratings[ratings.rating >= 3.5]
-    ratings['user_id'] = ratings.iloc[:, ('userId')]
-    ratings['item_id'] = ratings.iloc[:, ('movieId')]
-    ratings['timestamp'] = pd.to_datetime(ratings.iloc[:, ('timestamp')])
+    ratings = ratings.assign(user_id=ratings['userId'])
+    ratings = ratings.assign(item_id=ratings['movieId'])
+    ratings['timestamp'] = pd.to_datetime(ratings['timestamp'])
     ratings = ratings.drop(columns=['userId', 'movieId'])
     return ratings
 
 
-def _change_grain(user_items, items_to_tags, tags_to_categories):
+def reduce_to_common_items(ratings, taxonomy_labels):
+    """Reduces inputs to contain the same set of items."""
+
+    rated_items = set(ratings['item_id'].unique())
+    labeled_items = set(taxonomy_labels['item_id'].unique())
+    common_items = rated_items.intersection(labeled_items)
+
+    ratings = ratings.loc[ratings.item_id.isin(common_items)]
+    taxonomy_labels = taxonomy_labels.loc[taxonomy_labels.item_id.isin(common_items)]
+    return ratings, taxonomy_labels
+
+
+def change_grain(user_items, taxonomy_labels):
+    """Changes grain to prepare for binarization."""
+
     user_items = user_items.groupby('user_id')['item_id'].apply(list)
-    items_to_tags = items_to_tags.groupby('item_id')['tag'].apply(list)
-    tags_to_categories = tags_to_categories.groupby('tag')['category'].apply(list)
+    items_to_tags = taxonomy_labels.groupby('item_id')['tag'].apply(list)
+    tags_to_categories = taxonomy_labels.groupby('tag')['category'].apply(list)
 
     print 'Number of users: ', user_items.shape
     print 'Number of items: ', items_to_tags.shape
@@ -174,3 +210,28 @@ def shuffle_users(x):
     perm = np.arange(x.shape[0])
     np.random.shuffle(perm)
     return x[perm]
+
+
+def get_taxonomy_groundtruth(user_item_groundtruth, taxonomy_labels):
+    """
+    Takes groundtruth items that were removed from some training set, and
+    removes the corresponding items' taxonomy labels to create a 
+    taxonomy level groundtruth dataset.
+    """
+    groundtruth_items = list(set(user_item_groundtruth['item_id'].unique()))
+    return taxonomy_labels[taxonomy_labels.item_id.isin(groundtruth_items)]
+
+
+def read_k_folds(data_dir, k):
+    k_folds = []
+    for i in range(k):
+        fold_dir = os.path.join(data_dir, str(i))
+        ui_train = pd.read_csv(os.path.join(fold_dir, 'ui_train.csv'))
+        ui_test = pd.read_csv(os.path.join(fold_dir, 'ui_test.csv'))
+        taxonomy_labels = pd.read_csv(os.path.join(fold_dir, 'taxonomy_labels.csv'))
+
+        taxonomy_train = get_taxonomy_groundtruth(ui_train, taxonomy_labels)
+        taxonomy_test = get_taxonomy_groundtruth(ui_test, taxonomy_labels)
+
+        k_folds.append([ui_train, taxonomy_train, ui_test, taxonomy_test])
+    return k_folds
